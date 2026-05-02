@@ -28,14 +28,14 @@ class DroneParams:
     m_l: float = 0.094      # масса луча БпЛА с двигателем, винтом и регулятором, кг
     r: float = 0.075        # радиус корпуса, м
     r_r: float = 0.12       # радиус винта, м
-    l: float = 0.25         # длина луча БпЛА, м (из типовых данных, стр. 8)
+    l: float = 0.225        # длина луча БпЛА, м
     
-    # === Аэродинамические коэффициенты (Таблица 1, стр. 9) ===
-    k: float = 1e-5        # коэффициент аэродинамического сопротивления (10⁻⁵)
-    b: float = 1e-6        # коэффициент тяги БпЛА (10⁻⁷)
+    # === Аэродинамические коэффициенты (ФИНАЛЬНЫЕ) ===
+    k: float = 1e-6         # коэффициент аэродинамического сопротивления
+    b: float = 3e-9         # коэффициент тяги БпЛА (подобран для реалистичной скорости)
     
-    # === Параметры двигателей (стр. 9) ===
-    KV: float = 1000.0      # количество оборотов на вольт в минуту
+    # === Параметры двигателей ===
+    KV: float = 920.0       # количество оборотов на вольт в минуту
     eta: float = 0.7        # КПД под нагрузкой (η = 0,6…0,8)
     V_MIN: float = 0.0      # минимальное напряжение на моторе, В
     V_MAX: float = 12.0     # максимальное напряжение на моторе, В
@@ -92,8 +92,15 @@ class QuadcopterDynamics:
         self._compute_coefficients()
         
         # Параметры стабильности
-        self.max_roll_pitch_deg = 45.0   # максимальные углы крена/тангажа, градусы
+        self.max_roll_pitch_deg = 50.0   # максимальные углы крена/тангажа, градусы
         self.max_roll_pitch_rad = np.radians(self.max_roll_pitch_deg)
+        
+        # Коэффициенты демпфирования
+        self.damping_roll = 3.5
+        self.damping_pitch = 3.5
+        self.damping_yaw = 2
+        self.stability_factor = 0.6
+        self.linear_drag = 0.1
     
     def _compute_coefficients(self) -> None:
         """
@@ -163,6 +170,16 @@ class QuadcopterDynamics:
         vx, vy, vz = state[6], state[7], state[8]
         wx, wy, wz = state[9], state[10], state[11]
         
+        # ===== НОРМАЛИЗАЦИЯ УГЛОВ =====
+        phi = np.arctan2(np.sin(phi), np.cos(phi))
+        theta = np.arctan2(np.sin(theta), np.cos(theta))
+        psi = np.arctan2(np.sin(psi), np.cos(psi))
+        
+        # ===== ОГРАНИЧЕНИЕ УГЛОВ (предотвращает опрокидывание) =====
+        max_angle = np.radians(50)  # 50 градусов максимум
+        phi = np.clip(phi, -max_angle, max_angle)
+        theta = np.clip(theta, -max_angle, max_angle)
+        
         # Тригонометрические функции
         sin_phi = np.sin(phi)
         cos_phi = np.cos(phi)
@@ -193,25 +210,50 @@ class QuadcopterDynamics:
         dtheta = wy * cos_phi - wz * sin_phi
         dpsi = wy * (sin_phi / cos_theta_safe) + wz * (cos_phi / cos_theta_safe)
         
+        # ===== СОПРОТИВЛЕНИЕ ВОЗДУХА =====
+        air_density = 1.225  # кг/м³
+        Cd = 0.5  # коэффициент лобового сопротивления
+        A = 0.05  # площадь миделя, м²
+        
+        # Квадратичное сопротивление
+        drag_force_x = 0.5 * air_density * Cd * A * abs(vx) * vx
+        drag_force_y = 0.5 * air_density * Cd * A * abs(vy) * vy
+        drag_force_z = 0.5 * air_density * Cd * A * abs(vz) * vz
+        
+        # Линейное сопротивление (вязкость)
+        linear_drag_x = self.linear_drag * vx
+        linear_drag_y = self.linear_drag * vy
+        linear_drag_z = self.linear_drag * vz
+        
         # === Линейные ускорения ===
         term_vx = -cos_phi * sin_theta * cos_psi - sin_phi * sin_psi
-        dvx = self.a1 * term_vx * sum_w2
+        dvx = (self.a1 * term_vx * sum_w2 
+               - drag_force_x / self.p.m 
+               - linear_drag_x / self.p.m)
         
         term_vy = -cos_phi * sin_theta * sin_psi + sin_phi * cos_psi
-        dvy = self.a1 * term_vy * sum_w2
+        dvy = (self.a1 * term_vy * sum_w2 
+               - drag_force_y / self.p.m 
+               - linear_drag_y / self.p.m)
         
-        dvz = self.a2 + self.a1 * cos_phi * cos_theta * sum_w2
+        dvz = (self.a2 + self.a1 * cos_phi * cos_theta * sum_w2 
+               - drag_force_z / self.p.m 
+               - linear_drag_z / self.p.m)
         
-        # === Угловые ускорения ===
-        dwx = (self.a3 * wy * wz 
-               - self.a4 * wy * (omega1 - omega2 + omega3 - omega4)
-               + self.a5 * (omega2**2 - omega4**2))
+        # ===== УГЛОВЫЕ УСКОРЕНИЯ С ДЕМПФИРОВАНИЕМ =====
+        dwx = ((self.a3 * wy * wz 
+                - self.a4 * wy * (omega1 - omega2 + omega3 - omega4)
+                + self.a5 * (omega2**2 - omega4**2)) * self.stability_factor 
+               - self.damping_roll * wx)
         
-        dwy = (self.a6 * wx * wz
-               - self.a4 * wx * (omega1 - omega2 + omega3 - omega4)
-               + self.a5 * (omega1**2 - omega3**2))
+        dwy = ((self.a6 * wx * wz
+                - self.a4 * wx * (omega1 - omega2 + omega3 - omega4)
+                + self.a5 * (omega1**2 - omega3**2)) * self.stability_factor 
+               - self.damping_pitch * wy)
         
-        dwz = self.a7 * wx * wy - self.a8 * (omega1**2 - omega2**2 + omega3**2 - omega4**2)
+        dwz = ((self.a7 * wx * wy 
+                - self.a8 * (omega1**2 - omega2**2 + omega3**2 - omega4**2)) * self.stability_factor 
+               - self.damping_yaw * wz)
         
         # Сборка вектора производных
         derivative = np.array([
@@ -228,7 +270,14 @@ class QuadcopterDynamics:
                    dt: float) -> np.ndarray:
         """Интегрирование методом Эйлера."""
         deriv = self.compute_accelerations(state, omega1, omega2, omega3, omega4)
-        return state + deriv * dt
+        new_state = state + deriv * dt
+        
+        # Обновляем углы в state после интегрирования
+        new_state[3] = np.arctan2(np.sin(new_state[3]), np.cos(new_state[3]))
+        new_state[4] = np.arctan2(np.sin(new_state[4]), np.cos(new_state[4]))
+        new_state[5] = np.arctan2(np.sin(new_state[5]), np.cos(new_state[5]))
+        
+        return new_state
     
     def rk4_step(self, state: np.ndarray,
                  omega1: float, omega2: float, omega3: float, omega4: float,
@@ -242,7 +291,14 @@ class QuadcopterDynamics:
         k3 = f(state + 0.5 * dt * k2)
         k4 = f(state + dt * k3)
         
-        return state + (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
+        new_state = state + (dt / 6.0) * (k1 + 2.0*k2 + 2.0*k3 + k4)
+        
+        # Нормализация углов после интегрирования
+        new_state[3] = np.arctan2(np.sin(new_state[3]), np.cos(new_state[3]))
+        new_state[4] = np.arctan2(np.sin(new_state[4]), np.cos(new_state[4]))
+        new_state[5] = np.arctan2(np.sin(new_state[5]), np.cos(new_state[5]))
+        
+        return new_state
     
     def apply_control_with_delay(self, current_omega: np.ndarray,
                                   target_omega: np.ndarray,
